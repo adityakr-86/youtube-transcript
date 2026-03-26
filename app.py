@@ -15,6 +15,7 @@ REQUEST_DELAY_MAX = 6
 REQUESTS_BEFORE_COOLDOWN = 12
 COOLDOWN_TIME = 60
 MAX_RETRIES = 3
+HARD_BLOCK_SLEEP = 120
 
 # ==============================
 # GET VIDEOS
@@ -25,7 +26,6 @@ def get_videos(playlist_url):
         capture_output=True,
         text=True
     )
-
     lines = result.stdout.strip().split("\n")
     return [tuple(line.split("||", 1)) for line in lines if "||" in line]
 
@@ -57,57 +57,84 @@ def fetch_with_retry(video_id, ytt):
             msg = str(e).lower()
 
             if "blocking requests" in msg:
-                wait = 120 + random.uniform(5, 15)
-                time.sleep(wait)
+                time.sleep(HARD_BLOCK_SLEEP + random.uniform(5, 10))
             else:
-                wait = (2 ** attempt) + random.uniform(2, 5)
-                time.sleep(wait)
+                time.sleep((2 ** attempt) + random.uniform(2, 5))
 
     return None
 
 # ==============================
-# PROCESS
+# PROCESS RANGE
 # ==============================
-def process_playlist(playlist_url):
-    videos = get_videos(playlist_url)
+def process_range(videos, start_idx, end_idx):
     ytt = YouTubeTranscriptApi()
     formatter = TextFormatter()
 
-    output = StringIO()
+    selected_videos = videos[start_idx:end_idx]
 
-    total = len(videos)
+    batches = [
+        selected_videos[i:i + BATCH_SIZE]
+        for i in range(0, len(selected_videos), BATCH_SIZE)
+    ]
+
     progress = st.progress(0)
     status = st.empty()
+    log_placeholder = st.empty()
 
-    request_count = 0
+    logs = []
+    total = len(selected_videos)
+    processed = 0
 
-    for i, (vid, title) in enumerate(videos, start=1):
-        status.text(f"Processing {i}/{total}: {title}")
+    batch_outputs = []
 
-        transcript = fetch_with_retry(vid, ytt)
+    for batch_num, batch in enumerate(batches, start=1):
+        batch_buffer = StringIO()
+        request_count = 0
 
-        if transcript:
-            formatted = formatter.format_transcript(transcript)
+        for vid, title in batch:
+            processed += 1
+            status.text(f"Processing {processed}/{total}: {title}")
 
-            output.write("=" * 80 + "\n")
-            output.write(f"TITLE: {title}\n")
-            output.write(f"VIDEO ID: {vid}\n")
-            output.write("=" * 80 + "\n\n")
-            output.write(formatted + "\n\n\n")
+            transcript = fetch_with_retry(vid, ytt)
 
-        request_count += 1
+            if transcript:
+                formatted = formatter.format_transcript(transcript)
 
-        # Delay
-        time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+                batch_buffer.write("=" * 80 + "\n")
+                batch_buffer.write(f"TITLE: {title}\n")
+                batch_buffer.write(f"VIDEO ID: {vid}\n")
+                batch_buffer.write("=" * 80 + "\n\n")
+                batch_buffer.write(formatted + "\n\n\n")
 
-        # Cooldown
-        if request_count % REQUESTS_BEFORE_COOLDOWN == 0:
-            status.text("Cooling down...")
-            time.sleep(COOLDOWN_TIME)
+                msg = f"{processed:03d}. ✅ {title}"
+            else:
+                msg = f"{processed:03d}. ❌ {title}"
 
-        progress.progress(i / total)
+            logs.append(msg)
 
-    return output.getvalue()
+            # ✅ Clean log UI
+            log_text = "### 📜 Processing Log\n\n" + "\n\n".join(logs[-15:])
+            log_placeholder.markdown(log_text)
+
+            request_count += 1
+
+            # Delay between requests
+            time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+
+            # Cooldown
+            if request_count % REQUESTS_BEFORE_COOLDOWN == 0:
+                logs.append("🧊 Cooling down...")
+                log_placeholder.markdown(
+                    "### 📜 Processing Log\n\n" + "\n\n".join(logs[-15:])
+                )
+                time.sleep(COOLDOWN_TIME)
+
+            progress.progress(processed / total)
+
+        # Save batch output
+        batch_outputs.append((batch_num, batch_buffer.getvalue()))
+
+    return batch_outputs
 
 # ==============================
 # UI
@@ -115,21 +142,62 @@ def process_playlist(playlist_url):
 st.set_page_config(page_title="YouTube Transcript Extractor", layout="centered")
 
 st.title("📺 YouTube Playlist → Transcript Downloader")
+st.info("⚠️ Large playlists may take time due to YouTube rate limits.")
 
 playlist_url = st.text_input("Enter Playlist URL")
 
-if st.button("Generate Transcript"):
+# Session state
+if "videos" not in st.session_state:
+    st.session_state.videos = None
+
+# ==============================
+# FETCH PLAYLIST
+# ==============================
+if st.button("🔍 Fetch Playlist"):
     if playlist_url:
-        with st.spinner("Processing... This may take time ⏳"):
-            result = process_playlist(playlist_url)
+        with st.spinner("Fetching playlist..."):
+            videos = get_videos(playlist_url)
 
-        st.success("Done!")
+        if videos:
+            st.session_state.videos = videos
+            st.success(f"✅ Playlist loaded with {len(videos)} videos")
+        else:
+            st.error("❌ Failed to fetch playlist")
 
-        st.download_button(
-            label="📥 Download Transcript",
-            data=result,
-            file_name="transcripts.txt",
-            mime="text/plain"
-        )
-    else:
-        st.warning("Please enter a playlist URL")
+# ==============================
+# PREVIEW + RANGE
+# ==============================
+if st.session_state.videos:
+    videos = st.session_state.videos
+    total_videos = len(videos)
+
+    st.write(f"🎬 Total Videos: {total_videos}")
+
+    st.markdown("### 📋 Preview (First 5 Videos)")
+    for i, (_, title) in enumerate(videos[:5], start=1):
+        st.write(f"{i}. {title}")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        start_idx = st.number_input("Start Index", min_value=1, max_value=total_videos, value=1)
+
+    with col2:
+        end_idx = st.number_input("End Index", min_value=1, max_value=total_videos, value=min(10, total_videos))
+
+    # ==============================
+    # GENERATE
+    # ==============================
+    if st.button("🚀 Generate Transcript"):
+        with st.spinner("Processing... ⏳"):
+            batch_results = process_range(videos, start_idx - 1, end_idx)
+
+        st.success("✅ Done!")
+
+        for batch_num, content in batch_results:
+            st.download_button(
+                label=f"📥 Download Batch {batch_num}",
+                data=content,
+                file_name=f"transcripts_batch_{batch_num}.txt",
+                mime="text/plain"
+            )
